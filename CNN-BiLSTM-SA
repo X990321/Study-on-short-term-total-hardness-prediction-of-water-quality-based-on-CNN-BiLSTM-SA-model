@@ -1,0 +1,146 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import os
+from tensorflow.keras.layers import Layer, Dropout, LSTM, Bidirectional, Input, Conv1D, MaxPooling1D, Flatten
+from scipy import stats
+
+# 自定义自注意力层
+class SelfAttentionLayer(Layer):
+    def __init__(self, output_dim):
+        super(SelfAttentionLayer, self).__init__()
+        self.output_dim = output_dim
+        
+        self.W_q = tf.keras.layers.Dense(output_dim)  # 查询
+        self.W_k = tf.keras.layers.Dense(output_dim)  # 键
+        self.W_v = tf.keras.layers.Dense(output_dim)  # 值
+
+    def call(self, inputs):
+        Q = self.W_q(inputs)
+        K = self.W_k(inputs)
+        V = self.W_v(inputs)
+
+        attention_scores = tf.matmul(Q, K, transpose_b=True)
+        attention_weights = tf.nn.softmax(attention_scores, axis=-1)
+
+        context = tf.matmul(attention_weights, V)
+        
+        return context
+
+# 设置随机种子（3）
+seed = 1
+np.random.seed(seed)
+tf.random.set_seed(seed)
+
+# 读取数据
+data = pd.read_excel('data919.xlsx', header=None)
+data = data.iloc[:, 1:]  # 去除第一列
+data = data.apply(pd.to_numeric, errors='coerce').dropna()  # 确保数值型并删除NaN
+data = data.values  # 转换为numpy数组
+
+# 设置参数
+time_steps = 5
+num_features = 7
+output_dim = 50  # 自注意力层的输出维度
+
+# 创建滑动窗口特征
+def create_dataset(data, time_steps):
+    X, y = [], []
+    for i in range(len(data) - time_steps):
+        X.append(data[i:(i + time_steps), :num_features])  # 取第1到第7列作为输入
+        y.append(data[i + time_steps, 0])       # 预测第1列作为输出
+    return np.array(X), np.array(y)
+
+# 创建输入和输出
+X, y = create_dataset(data, time_steps)
+
+# 数据归一化
+scaler_X = MinMaxScaler()
+scaler_y = MinMaxScaler()
+
+X_scaled = scaler_X.fit_transform(X.reshape(-1, num_features)).reshape(-1, time_steps, num_features)
+y_scaled = scaler_y.fit_transform(y.reshape(-1, 1))
+
+# 划分训练集和测试集
+train_size = int(len(X_scaled) * 0.8)  # 80%为训练集，20%为测试集
+X_train, X_test = X_scaled[:train_size], X_scaled[train_size:]
+y_train, y_test = y_scaled[:train_size], y_scaled[train_size:]
+
+# 构建BiLSTM模型(32,42)
+inputs = Input(shape=(time_steps, num_features))
+
+# 添加卷积层
+cnn_out = Conv1D(filters=64, kernel_size=2, activation='relu') # CNN层
+cnn_out = MaxPooling1D(pool_size=2)  # 最大池化层
+cnn_out = Dropout(0.1)  # Dropout层
+
+bi_lstm_out = Bidirectional(LSTM(32, return_sequences=True))(inputs)
+bi_lstm_out = Dropout(0.05)(bi_lstm_out)  # 添加Dropout层
+attention_out = SelfAttentionLayer(output_dim)(bi_lstm_out)  # 自注意力层
+bi_lstm_out2 = Bidirectional(LSTM(64))(attention_out)
+outputs = tf.keras.layers.Dense(1)(bi_lstm_out2)
+model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+# 编译模型
+model.compile(optimizer='adam', loss='mean_squared_error')
+
+# 添加早停和学习率调度器
+early_stopping = EarlyStopping(monitor='val_loss', patience=40, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=20, min_lr=1e-7)
+
+# 训练模型
+history = model.fit(X_train, y_train, epochs=400, batch_size=7, 
+                    validation_data=(X_test, y_test), 
+                    verbose=1, 
+                    callbacks=[early_stopping, reduce_lr])
+
+# 预测
+y_pred_scaled = model.predict(X_test)
+
+# 反归一化
+y_pred = scaler_y.inverse_transform(y_pred_scaled)
+y_test_inverse = scaler_y.inverse_transform(y_test)
+
+# 计算误差指标
+rmse = np.sqrt(mean_squared_error(y_test_inverse, y_pred))
+mae = mean_absolute_error(y_test_inverse, y_pred)
+r2 = r2_score(y_test_inverse, y_pred)
+# 计算 MAPE
+mape = np.mean(np.abs((y_test_inverse - y_pred) / y_test_inverse)) * 100
+# 计算 Pearson 相关系数 r 和 p-value
+r, p_value = stats.pearsonr(y_test_inverse.flatten(), y_pred.flatten())
+
+# 输出结果
+print(f"RMSE: {rmse:.4f}")
+print(f"MAE: {mae:.4f}")
+print(f"R²: {r2:.4f}")
+print(f"MAPE: {mape:.4f}%")
+print(f"Pearson 相关系数 r: {r:.4f}")
+print(f"p-value: {p_value:.4e}")
+
+# 将预测结果和真实值保存到 DataFrame
+results = pd.DataFrame({
+    '真实值': y_test_inverse.flatten(),
+    '预测值': y_pred.flatten()
+})
+
+# 获取当前用户的桌面路径
+desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+
+# 保存结果到桌面
+results.to_excel(os.path.join(desktop_path, 'CNN-BiLSTM-SA预测结果.xlsx'), index=False) 
+
+# 可视化结果
+plt.figure(figsize=(10, 6))
+plt.plot(y_test_inverse, label='true value', color='blue')
+plt.plot(y_pred, label='predicted value', color='red')
+plt.title('Comparison between real value and predicted value')
+plt.xlabel('day')
+plt.ylabel('Value')
+plt.legend()
+plt.show()
+
